@@ -3,11 +3,11 @@ import json
 from pathlib import Path
 import re
 import os
+import datetime
 import shutil
 import random
 import time
 from collections import namedtuple
-from datetime import datetime
 from enum import Enum
 from io import BytesIO
 from zipfile import ZipFile
@@ -19,6 +19,7 @@ import xmltodict
 from amazon.ion import simpleion
 from mobi import extract
 from rich import print
+from termcolor import cprint
 
 from kindle_download_helper import amazon_api
 from kindle_download_helper.config import (
@@ -53,6 +54,120 @@ KINDLE_TABLE_HEAD = "| ID | Title | Authors | Acquired | Last_READ| Highlight_Co
 KINDLE_STAT_TEMPLATE = "| {id} | {title} | {authors} | {acquired} | {last_read} | {highlight}| {price} | \n"
 
 
+class ConsolePage:
+    def __init__(self, data, out_epub_dir):
+        self.data = data
+        self.page_size = 10
+        self.current_page = 1
+        self.index = 1
+        self.out_epub_dir = out_epub_dir
+        self.total_pages = (len(data) + self.page_size - 1) // self.page_size
+
+    def centrifugal_separation(self):
+        # 读取下载历史文件
+        download_history = self.read_download_history()
+        origin_data = []
+        for item in self.data:
+            book_name = trim_title_suffix(item['title'].encode("utf8").decode())
+            book_name = re.sub(
+                r"(\（[^)]*\）)|(\([^)]*\))|(\【[^)]*\】)|(\[[^)]*\])|(\s)", "", book_name
+            )
+            book_name = book_name.replace(" ", "")
+            out_epub_path = Path.cwd() / self.out_epub_dir / (book_name + ".epub")
+            # 判断文件是否存在于下载历史中
+            file_info = self.find_file_in_download_history(download_history, (book_name + ".epub"))
+            if file_info:
+                # 检查文件大小是否一致
+                if os.path.exists(out_epub_path):
+                    if os.path.getsize(out_epub_path) < file_info['size']:
+                        item["status"] = "break"
+                    else:
+                        item["status"] = "downloaded"
+                else:
+                    item["status"] = "delete"
+            else:
+                item["status"] = "not_download"
+            
+            #TODO only for solve old books
+            # if os.path.exists(out_epub_path):
+            #     item["saved"] = True
+            #     # 将文件信息添加到下载历史文件中 
+            #     file_name = os.path.basename(out_epub_path)
+            #     file_size = os.path.getsize(out_epub_path)
+            #     current_date = datetime.date.today().strftime("%Y-%m-%d")
+            #     self.add_to_download_history(file_name, file_size, current_date)
+
+            # else:
+            #     item["saved"] = False
+            origin_data.append(item)
+        # sorted_data = sorted(origin_data, key=lambda x: x['saved'])
+        sorted_data = sorted(origin_data, key=lambda x: ("not_download" in x["status"], "break" in x["status"], "delete" in x["status"], "downloaded" in x["status"]),reverse=True)
+        self.data = sorted_data
+        return sorted_data
+    def add_to_download_history(self, file_name, file_size, date):
+        history_file = "download_history.txt"
+        with open(history_file, 'a', encoding='utf-8') as file:
+            file.write(f"{file_name},{file_size},{date}\n")
+
+    def read_download_history(self):
+        history_file = "download_history.txt"
+        download_history = []
+        if os.path.exists(history_file):
+            with open(history_file, 'r', encoding='utf-8') as file:
+                for line in file:
+                    line = line.strip()
+                    if line:
+                        file_info = line.split(',')
+                        if len(file_info) == 3:
+                            download_history.append({
+                                'name': file_info[0],
+                                'size': int(file_info[1]),
+                                'date': datetime.datetime.strptime(file_info[2], "%Y-%m-%d").date()
+                            })
+        return download_history
+
+    def find_file_in_download_history(self, download_history, file_name):
+        for file_info in download_history:
+            if file_info['name'] == file_name:
+                return file_info
+        return None
+
+    def display_current_page(self):
+        os.system('clear') 
+        start_index = (self.current_page - 1) * self.page_size
+        end_index = start_index + self.page_size
+        page_data = self.data[start_index:end_index]
+
+        for item in page_data:
+            title = item['title'][:40] + "..." if len(item['title']) > 40 else item['title']
+            print(f"{self.index}. ",end ="")
+            if item["status"] == "not_download":
+                cprint('[新] ', 'light_magenta', attrs=['bold','blink'],end="")
+            elif item["status"] == "break":
+                cprint('[损] ', 'yellow', attrs=['bold'],end="")
+            elif item["status"] == "delete":
+                cprint('[删] ', 'light_green', attrs=['bold'],end="")
+            elif item["status"] == "downloaded":
+                cprint('[已] ', 'light_green', attrs=['bold'],end="")
+            cprint(f"{title}", 'light_grey')
+            self.index += 1
+        print(f"\nPage {self.current_page}/{self.total_pages}")
+
+    def go_to_next_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+        else:
+            print("已经是最后一页了")
+
+    def go_to_previous_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.index -= 10
+        else:
+            self.index = 1
+            print("已经是第一页了")
+
+
 class Scope(Enum):
     REQUIRED = 1
     PREFERRED = 2
@@ -68,7 +183,7 @@ Request = namedtuple("Request", ["method", "url", "fn", "headers"])
 
 def _build_correlation_id(device, serial, asin, timestamp):
     if timestamp is None:
-        timestamp = datetime.utcnow().timestamp()
+        timestamp = datetime.datetime.utcnow().timestamp()
         timestamp = str(int(timestamp) * 1000)
     return f"Device:{device}:{serial};kindle.EBOK:{asin}:{timestamp}"
 
@@ -249,8 +364,24 @@ class NoKindle:
         print(r.json())
 
     def make_all_pdoc_info(self):
-        # TODO
-        pass
+        # 创建控制台页面对象
+        console_page = ConsolePage(self.pdocs,self.out_epub_dir)
+        self.pdocs = console_page.centrifugal_separation()
+
+        # 不断接收键盘输入，执行相应的操作
+        while True:
+            console_page.display_current_page()
+            command = input("请输入命令（n-下一页，b-上一页，q-退出,回车默认下载更新部分）：")
+            if command == "n":
+                console_page.go_to_next_page()
+            elif command == "b":
+                console_page.go_to_previous_page()
+            elif command == "q":
+                return "quit"
+            elif command == "":
+                break
+            else:
+                print("无效的命令，请重新输入")
 
     def make_all_ebook_info(self):
         # TODO pdoc
@@ -448,8 +579,19 @@ class NoKindle:
             shutil.copy2(epub_file, out_epub)
             # delete it
             shutil.rmtree(epub_dir)
+
+            # 将文件信息添加到下载历史文件中
+            file_name = os.path.basename(out_epub)
+            file_size = os.path.getsize(out_epub)
+            current_date = datetime.date.today().strftime("%Y-%m-%d")
+            self.add_to_download_history(file_name, file_size, current_date)
         except Exception as e:
             print(str(e))
+
+    def add_to_download_history(self, file_name, file_size, date):
+        history_file = "download_history.txt"
+        with open(history_file, 'a', encoding='utf-8') as file:
+            file.write(f"{file_name},{file_size},{date}\n")
 
     def download_pdoc(self, asin):
         """from mkb79/kindle Downloading personal added documents"""
@@ -652,12 +794,15 @@ class NoKindle:
             time.sleep(1)
 
     def download_all_pdocs(self):
+        command = self.make_all_pdoc_info()
+        if command == "quit":
+            return
         for b in self.pdocs:
             try:
-                self.download_pdoc(b["ASIN"])
+                if b["status"] == "not_download" or b["status"] == "break":
+                    self.download_pdoc(b["ASIN"])
             except Exception as e:
                 import traceback
-
                 traceback.print_exc()
                 print(e)
             # spider rule
@@ -712,7 +857,6 @@ class NoKindle:
             for row in book_list:
                 writer.writerow(row)
         print("File: my_kindle_stats.csv and my_kindle_stats.md have been generated")
-
 
 if __name__ == "__main__":
     kindle = NoKindle()
